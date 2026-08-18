@@ -54,6 +54,7 @@ var Streams = Q.Streams;
  *   @param {Q.Event} [options.onUpdate] Event that receives parameters "data", "entering", "exiting", "updating"
  *   @param {Q.Event} [options.onRefresh] Event that occurs when the tool is completely refreshed, the "this" is the tool.
  *      Parameters are (previews, map, entering, exiting, updating).
+ *      Also fired after a local composer creates a stream (own related messages skip refresh).
  */
 Q.Tool.define("Streams/related", function _Streams_related_tool (options) {
 	var tool = this;
@@ -236,6 +237,12 @@ Q.Tool.define("Streams/related", function _Streams_related_tool (options) {
 			}
 
 			mutation.removedNodes.forEach(function(removedElement) {
+				// Reparenting inside the tool (e.g. Places/locations wrapExpandable)
+				// also fires childList removals; keep the map entry in that case.
+				if (tool.element.contains(removedElement)) {
+					return;
+				}
+
 				var publisherId = Q.getObject("options.streams_preview.publisherId", removedElement);
 				var streamName = Q.getObject("options.streams_preview.streamName", removedElement);
 				if (!publisherId || !streamName) {
@@ -446,6 +453,39 @@ Q.Tool.define("Streams/related", function _Streams_related_tool (options) {
 		// ---- normal preview-tool path ---------------------------------------
 
 		function _placeRelatedTool (element) {
+			// If a preview was reparented under a wrapper inside this related tool,
+			// insert relative to that wrapper (direct child of $container), not the
+			// nested preview — otherwise new items land inside the wrapper.
+			function _placementAnchor(el) {
+				var container = $container[0];
+				var node = el && el.nodeType ? el : null;
+				if (!node || !container || !container.contains(node)) {
+					return null;
+				}
+				while (node.parentNode && node.parentNode !== container) {
+					node = node.parentNode;
+				}
+				return (node.parentNode === container) ? node : null;
+			}
+
+			function _placeBefore(anchor, el) {
+				var node = _placementAnchor(anchor);
+				if (node && node !== el) {
+					$(node).before(el);
+				} else {
+					$container.prepend(el);
+				}
+			}
+
+			function _placeAfter(anchor, el) {
+				var node = _placementAnchor(anchor);
+				if (node && node !== el) {
+					$(node).after(el);
+				} else {
+					$container.append(el);
+				}
+			}
+
 			// select closest larger weight
 			var closestLargerWeight = null;
 			var closestLargerElement = null;
@@ -464,28 +504,45 @@ Q.Tool.define("Streams/related", function _Streams_related_tool (options) {
 
 			if (closestLargerElement) {
 				if (ascending) {
-					$(closestLargerElement).before(element);
+					_placeBefore(closestLargerElement, element);
 				} else {
-					$(closestLargerElement).after(element);
+					_placeAfter(closestLargerElement, element);
 				}
 			} else {
 				if (ascending) {
 					if (elementsAmount <= 1) {
 						$container.append(element);
 					} else {
-						$(".Streams_related_stream:last", $container).after(element);
+						var $last = $(".Streams_related_stream", $container).filter(function () {
+							return this !== element
+								&& $(this).closest('.Streams_related_tool')[0] === tool.element;
+						}).last();
+						if ($last.length) {
+							_placeAfter($last[0], element);
+						} else {
+							$container.append(element);
+						}
 					}
 				} else {
 					if (elementsAmount <= 1) {
 						$container.prepend(element);
 					} else {
-						$(".Streams_related_stream:first", $container).before(element);
+						var $first = $(".Streams_related_stream", $container).filter(function () {
+							return this !== element
+								&& $(this).closest('.Streams_related_tool')[0] === tool.element;
+						}).first();
+						if ($first.length) {
+							_placeBefore($first[0], element);
+						} else {
+							$container.prepend(element);
+						}
 					}
 				}
 			}
 
 			var composerPosition = state.composerPosition || (ascending ? "last" : "first");
-			var $composer = $container.find('.Streams_related_composer');
+			// Only this related tool's own composers — not nested Streams/related
+			var $composer = $container.children('.Streams_related_composer');
 				if (composerPosition === "first") {
 					$container.prepend($composer);
 				} else if (composerPosition === "last") {
@@ -547,24 +604,72 @@ Q.Tool.define("Streams/related", function _Streams_related_tool (options) {
 					previewState.beforeCreate.remove(tool);
 				}, tool);
 				previewState.onCreate.set(function (stream) {
-
 					element.addClass('Streams_related_stream');
-
-					// set data-streamName attribute to mark tool as not composer
 					element.setAttribute("data-streamName", stream.fields.name);
-
-					// set weight to preview tool and to element
 					Q.setObject("options.streams_preview.related.weight", this.state.related.weight, element);
 					element.setAttribute('data-weight', this.state.related.weight);
 
-					// check if such preview already exists before place
-					if (Q.handle(state.beforeRenderPreview, tool, [Q.extend({}, tff, {name: stream.fields.name}), element]) === false) {
-						element.remove();
-					}
-					// place new preview to the valid place in the list
-					_placeRelatedTool(element);
+					var publisherId = stream.fields.publisherId;
+					var streamName = stream.fields.name;
 
+					// Register in previewElements so realtime refresh skips it
+					Q.setObject([publisherId, streamName], element, tool.previewElements);
+
+					if (Q.handle(state.beforeRenderPreview, tool, [Q.extend({}, tff, {name: streamName}), element]) === false) {
+						// Realtime refresh (or another path) already rendered this stream.
+						// Do not _placeRelatedTool — that would re-insert this element and duplicate.
+						var existing = null;
+						$(".Streams_preview_tool:not(.Streams_preview_composer)", tool.element).each(function () {
+							if (this !== element
+							&& this.getAttribute("data-publisherId") === publisherId
+							&& this.getAttribute("data-streamName") === streamName) {
+								existing = this;
+								return false;
+							}
+						});
+						if (existing) {
+							Q.setObject([publisherId, streamName], existing, tool.previewElements);
+						} else if (Q.getObject([publisherId, streamName], tool.previewElements) === element) {
+							delete tool.previewElements[publisherId][streamName];
+							if (Q.isEmpty(tool.previewElements[publisherId])) {
+								delete tool.previewElements[publisherId];
+							}
+						}
+						element.remove();
+						addComposer(streamType, params);
+						setTimeout(function () {
+							var previewTool = existing
+								? Q.Tool.from(existing, 'Streams/preview')
+								: null;
+							var previews = [];
+							var map = {};
+							if (previewTool) {
+								previews.push(previewTool);
+								map[Streams.key(publisherId, streamName)] = 0;
+							}
+							state.onRefresh.handle.call(tool, previews, map, [stream], [], []);
+						}, 0);
+						return;
+					}
+					// Leave the new stream where the composer was (first/last by
+					// design). Re-sorting by weight here pushes items under when
+					// the new relation weight is still lower than existing ones.
 					addComposer(streamType, params);
+
+					// Own related messages skip tool.refresh(); fire onRefresh so
+					// dependents can react to locally created previews.
+					// Defer until after Streams/preview finishes onCreate (removes
+					// Streams_preview_composer) so handlers that scan children see it.
+					var previewTool = Q.Tool.from(element, 'Streams/preview');
+					var previews = [];
+					var map = {};
+					if (previewTool) {
+						previews.push(previewTool);
+						map[Streams.key(publisherId, streamName)] = 0;
+					}
+					setTimeout(function () {
+						state.onRefresh.handle.call(tool, previews, map, [stream], [], []);
+					}, 0);
 				}, tool);
 
 				Q.handle(state.onComposer, tool, [preview]);
@@ -761,6 +866,7 @@ Q.Tool.define("Streams/related", function _Streams_related_tool (options) {
 	 */
 	relatedResult: function (result, onUpdate, partial) {
 		var tool = this;
+		var state = this.state;
 
 		if (tool.state.realtime && !tool.stream) {
 			// join user to category stream to allow get messages
@@ -803,13 +909,16 @@ Q.Tool.define("Streams/related", function _Streams_related_tool (options) {
 					if (fields.type !== tool.state.relationType) {
 						return;
 					}
-					if (!Users.loggedInUser
-						|| msg.byUserId != Users.loggedInUser.id
-						|| msg.byClientId != Q.clientId()
-						|| msg.ordinal !== tool.state.lastMessageOrdinal + 1) {
-						tool.refresh();
+					// Skip refresh for relations we just created locally — onCreate
+					// already added the preview. Refreshing races and duplicates it.
+					if (Users.loggedInUser
+					&& msg.byUserId == Users.loggedInUser.id
+					&& msg.byClientId == Q.clientId()) {
+						Streams.related.cache.removeEach(
+							[state.publisherId, state.streamName]
+						);
 					} else {
-						tool.refresh(); // TODO: make the weights of the items in between update in the client
+						tool.refresh();
 					}
 					tool.state.lastMessageOrdinal = msg.ordinal;
 				}, tool);

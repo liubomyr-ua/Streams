@@ -644,6 +644,8 @@ Streams.onEphemeral = Q.Event.factory(priv._ephemeralHandlers, ["", ""]);
  * By the time this event happens, the platform has already taken any default actions
  * for standard events such as "Streams/joined", etc. so the stream and all caches
  * are up-to-date, e.g. the participants include the newly joined participant, etc.
+ * Handlers are called with the up-to-date stream as `this` when it is cached or retained,
+ * otherwise `this` is the Streams namespace.
  * @event onMessage
  * @param {String} streamType type of the stream to which a message is posted, pass "" for all types
  * @param {String} messageType type of the message, pass "" for all types
@@ -739,6 +741,54 @@ Streams.onInvitedUserAction = new Q.Event();
  * when the flow is completed.
  * @event onInviteComplete
  */
+/**
+ * Participant-role helpers.
+ * @class Streams.Participant
+ */
+Streams.Participant = Streams.Participant || {};
+
+/**
+ * Which participant roles the logged-in user may grant on a stream.
+ *
+ * Use this to decide whether to show an "add roles" control at all: it comes
+ * back empty both when the stream type declares no vocabulary and when the
+ * viewer is entitled to grant none of it, so a caller never has to tell those
+ * two apart to know there is nothing to offer.
+ *
+ * Results are cached per (publisherId, streamName) for the page, since the
+ * answer only changes when someone's own roles change.
+ *
+ * @method rolesAvailable
+ * @static
+ * @param {String} publisherId
+ * @param {String} streamName
+ * @param {Function} callback Receives (err, array of {role, title, emoji})
+ */
+Streams.Participant.rolesAvailable = Q.getter(
+function _Streams_Participant_rolesAvailable(publisherId, streamName, callback) {
+	Q.req('Streams/participantRoles', ['data'], function (err, response) {
+		var msg = Q.firstErrorMessage(err, response && response.errors);
+		if (msg) {
+			return Q.handle(callback, this, [msg, []]);
+		}
+		var data = Q.getObject('slots.data', response) || {};
+		Q.handle(callback, this, [null, data.available || []]);
+	}, {
+		fields: { publisherId: publisherId, streamName: streamName }
+	});
+}, {
+	cache: Q.Cache.document('Streams.Participant.rolesAvailable', 100)
+});
+
+/**
+ * Occurs once a followed invite has been resolved, whether the user accepted or
+ * declined, and whether that happened in a dialog or by auto-accept on the
+ * server. First parameter is a Boolean: true if accepted. This is the seam for
+ * whatever flow comes next, e.g. onboarding.
+ * @event onInviteResolved
+ */
+Streams.onInviteResolved = new Q.Event();
+
 Streams.onInviteComplete = new Q.Event(function () {
 	Q.handle(Q.Users.onComplete);
 }, 'Streams');
@@ -754,9 +804,13 @@ function _connectSockets(refresh) {
 	if (!Users.loggedInUser) {
 		return false;
 	}
-	// 
-	Streams.retainWith('Streams')
-	.get(Users.loggedInUser.id, 'Streams/participating');
+	// Retain Streams/invited so invite messages reach this client even when
+	// Users.Socket.emitToUser misses. The online-invite handler listens on
+	// Streams.onMessage directly (not showNoticeIfSubscribed), so retention
+	// does not suppress the consent dialog.
+	var uid = Users.loggedInUser.id;
+	Streams.retainWith('Streams').get(uid, 'Streams/participating');
+	Streams.retainWith('Streams').get(uid, 'Streams/invited');
 	if (refresh) {
 		_debouncedRefresh();
 	}
@@ -846,6 +900,10 @@ Q.Tool.define({
 	},
 	"Streams/subscription" : "{{Streams}}/js/tools/subscription.js",
 	"Streams/interests"	: "{{Streams}}/js/tools/interests.js",
+	"Streams/markdown": {
+		js: "{{Streams}}/js/tools/markdown.js",
+		css: "{{Streams}}/css/tools/markdown.css"
+	},
 	"Streams/lookup"	   : "{{Streams}}/js/tools/lookup.js",
 	"Streams/relate"	   : "{{Streams}}/js/tools/relate.js",
 	"Streams/related"	  : "{{Streams}}/js/tools/related.js",
@@ -931,7 +989,11 @@ Q.Tool.define({
 	},
 	"Streams/image/coverflow": {
 		js: "{{Streams}}/js/tools/image/coverflow.js"
-	}
+	},
+	"Streams/QRconnect": {
+		js: "{{Streams}}/js/tools/QRconnect.js",
+		css: "{{Streams}}/css/tools/QRconnect.css"
+	},
 });
 
 Streams.Chat = {
@@ -1068,7 +1130,7 @@ Streams.Dialogs = Q.Method.define({
             templateName: "Streams/templates/invite/dialog",
             photo: true
         }       
-    }),
+    })
 }, '{{Streams}}/js/methods/Streams/Dialogs', function () {
 	return [Users, Streams];
 });
@@ -1941,10 +2003,13 @@ var Stream = Streams.Stream = function (fields) {
 	for (var k in Streams.Stream.properties) {
 		if (k in fields) {
 			var v = this[k] = fields[k];
-			if (k === 'access') {
+			if (k === 'access' && v) {
 				this.access = Q.copy(v);
-			} else if (k === 'participant') {
-				this.participant = new Q.Streams.Participant(v);
+			} else if (k === 'participant' && v) {
+				var p = this.participant = new Q.Streams.Participant(v);
+				Q.Streams.Participant.get.cache.set(
+					[v.publisherId, v.streamName, v.userId], 0, p, [null, p]
+				);
 			}
 			delete this.fields[k];
 		}
@@ -2217,6 +2282,7 @@ Stream.release = function _Stream_release (publisherId, streamName) {
  *   @param {Number} [options.unlessSocket] Whether to avoid doing any requests when a socket is attached
  *   @param {Object} [options.changed=null] An Object of {fieldName: true} pairs naming fields to trigger change events for, even if their values stayed the same.
  *   @param {Boolean} [options.evenIfNotRetained] If the stream wasn't retained (for example because it was missing last time), then refresh anyway
+ *   @param {Object} [options.getOptions] Any extra options to pass to Q.Streams.get when called
  *   @param {Object} [options.extra] Any extra parameters to pass to the callback
  * @return {boolean} Returns false if refresh was canceled because stream was not retained
  */
@@ -2252,7 +2318,7 @@ Stream.refresh = function _Stream_refresh (publisherId, streamName, callback, op
 						}
 					}
 				}
-			});
+			}, o.getOptions || {});
 		}, options);
 		if (result === null || result instanceof Q.Pipe) {
 			// We didn't even try to wait for messages,
@@ -2847,6 +2913,8 @@ Stream.onEphemeral = Q.Event.factory(priv._streamEphemeralHandlers, ["", "", ""]
  * By the time this event happens, the platform has already taken any default actions
  * for standard events such as "Streams/joined", etc. so the stream and all caches
  * are up-to-date, e.g. the participants include the newly joined participant, etc.
+ * Handlers are called with the up-to-date stream as `this` when it is cached or retained,
+ * otherwise `this` is the Streams namespace.
  * @event onMessage
  * @static
  * @param {String} [publisherId] id of publisher which is publishing the stream
@@ -3028,6 +3096,8 @@ Stream.onRelease = Q.Event.factory(priv._streamReleaseHandlers, ["", ""]);
  * By the time this event happens, the platform has already taken any default actions
  * for standard events such as "Streams/joined", etc. so the stream and all caches
  * are up-to-date, e.g. the participants include the newly joined participant, etc.
+ * Handlers are called with the up-to-date stream as `this` when it is cached or retained,
+ * otherwise `this` is the Streams namespace.
  * @event onMessage
  * @param {String} [messageType] type of the message, or its ordinal, pass "" for all types
  */
@@ -3507,7 +3577,6 @@ Sp.unrelate = Sp.unrelateFrom = function _Stream_prototype_unrelateFrom (fromPub
  * @class Streams
  */
 
-
 /**
  * Constructs a message from fields, which are typically returned from the server.
  * @class Streams.Message
@@ -3719,7 +3788,7 @@ Message.post = new Q.Method({
  *   @param {Number} [options.timeout=1000] The maximum amount of time to wait and hope the messages will arrive via sockets. After this we just request them again.
  *   @param {Number} [options.unlessSocket=true] Whether to avoid doing any requests when a socket is attached and user is a participant in the stream
  *   @param {Boolean} [options.evenIfNotRetained] Set this to true to wait for messages posted to the stream, in the event that it wasn't cached or retained.
- *   @param {Boolean} [options.checkMessageCache] Set this to true to also the message cache 
+ *   @param {Boolean} [options.checkMessageCache] If true, use Message.latest (processed ordinals) for ordering; otherwise use stream.fields.messageCount (known watermark).
  * @return {Boolean|null|Q.Pipe}
  *   Returns false if the cached stream already got this message.
  *   Returns true if we decided to send a request for the messages.
@@ -3730,15 +3799,18 @@ Message.post = new Q.Method({
 Message.wait = function _Streams_Message_wait (publisherId, streamName, ordinal, callback, options) {
 	var o = Q.extend({}, Message.wait.options, options);
 	var alreadyCalled = false, handlerKey;
-	var latest = Q.Streams.Message.latestOrdinal(publisherId, streamName, o.checkMessageCache);
-	var ps = Q.Streams.key(publisherId, streamName);
+	var ps = Streams.key(publisherId, streamName);
+	var processed = Message.latest[ps] || 0;
+	var known = Message.latestOrdinal(publisherId, streamName, false);
+	// Processed ordinals for Streams/post ordering; messageCount watermark for refresh catch-up.
+	var latest = o.checkMessageCache ? processed : known;
 	var wasRetained = priv._retainedStreams[ps];
 	if (!latest || (!wasRetained && !o.evenIfNotRetained)) {
 		// There is no cache for this stream, so we won't wait for previous messages.
 		return null;
 	}
 	if (ordinal >= 0 && ordinal <= latest && latest > 0) {
-		// The cached stream already got this message, or the message arrived on the client
+		// The previous ordinal was already processed (or known to the client for refresh).
 		Q.handle(callback, this, [[]]);
 		return false;
 	}
@@ -3825,11 +3897,9 @@ Message.wait = function _Streams_Message_wait (publisherId, streamName, ordinal,
 			if (err) {
 				return Q.handle(callback, this, [null, err]);
 			}
-			if (latest) {
-				// Don't simulate messages if latest = 0 because
-				// cache was either lost or evicted,
-				// Instead, we should just load latest stream state
-				// and trigger the onRefresh event.
+			if (o.checkMessageCache ? processed : known) {
+				// Don't simulate if there is no watermark (processed or messageCount),
+				// e.g. cache was lost or evicted — just load stream state via onRefresh.
 				priv._simulatePosting(messages, extras);
 			}
 			ordinal = parseInt(ordinal);
@@ -4543,6 +4613,28 @@ Q.onInit.add(function _Streams_onInit() {
 	}
 
 	Users.onLogin.set(function (user) {
+		// After registration, _onComplete fires Users.onLogin with the user
+		// argument -- but when onboarding runs in between, startOnboarding
+		// stores _onComplete as its callback, and the onboarding tool fires
+		// onComplete with no arguments, so user arrives undefined here.
+		// Fall back to the already-set loggedInUser, which is assigned
+		// before _onComplete runs (line 250: Users.loggedInUser = new User(user)).
+		if (!user) {
+			user = Users.loggedInUser;
+		}
+		if (!user) { return; }
+		var params = Q.getObject("Q.plugins.Streams.invited.dialog");
+		if (!params) {
+			return; // server auto-accepted, or nothing is pending
+		}
+		_prepareInvitedParams(params, function () {
+			_showInvitedDialog(params, function (err, accepted) {
+				Q.handle(Streams.onInviteResolved, Streams, [!!accepted, params]);
+			});
+		}, true);
+	}, "Streams.invited");
+
+	Users.onLogin.set(function (user) {
 		if (user) { // the user changed
 			Interests.my = {};
 			_clearCaches();
@@ -4599,19 +4691,67 @@ Q.onInit.add(function _Streams_onInit() {
 	}
 
 	/**
-	 * Listen for messages and show them as notices
+	 * Online registered-user invites arrive as Streams/invited messages, not via
+	 * an invite link. Fetch the same dialog payload Streams_after_Q_objects would
+	 * set, then open the consent dialog (_showInvitedDialog) in place.
+	 */
+	var _onlineInviteTokensShown = {};
+	function _showOnlineInviteDialog(message) {
+		var token = message.getInstruction('token');
+		if (!token || _onlineInviteTokensShown[token]) {
+			return;
+		}
+		_onlineInviteTokensShown[token] = true;
+		Q.req('Streams/invite', ['dialog'], function (err, response) {
+			var msg = Q.firstErrorMessage(err, response && response.errors);
+			if (msg) {
+				_onlineInviteTokensShown[token] = false;
+				return console.warn('Streams.invite.dialog:', msg);
+			}
+			var params = Q.getObject(['slots', 'dialog'], response);
+			if (!params) {
+				// Already resolved, or server declined to show a dialog
+				return;
+			}
+			Q.setObject('Q.plugins.Streams.invited.dialog', params);
+			_prepareInvitedParams(params, function () {
+				_showInvitedDialog(params, function (err, accepted) {
+					Q.handle(Streams.onInviteResolved, Streams, [!!accepted, params]);
+				});
+			});
+		}, { fields: { token: token } });
+	}
+
+	/**
+	 * Listen for invite messages (always) and optionally show other notices
 	 */
 	function _notificationsToNotice () {
 		var userId = Q.Users.loggedInUserId();
-		var notificationsAsNotice = Q.getObject("Q.plugins.Streams.notifications.notices");
-
-		if (!userId || !notificationsAsNotice) {
+		if (!userId) {
 			return;
 		}
+		var notificationsAsNotice = Q.getObject("Q.plugins.Streams.notifications.notices");
 
 		Q.Streams.onMessage('', '')
 		.set(function (message) {
 			var messageType = message.type;
+
+			// skip myself messages
+			if (message.byUserId === userId) {
+				return;
+			}
+
+			// Online invite: open the consent dialog directly (same as following
+			// the invite link). Independent of notices config / stream retention.
+			if (messageType === "Streams/invited") {
+				_showOnlineInviteDialog(message);
+				return;
+			}
+
+			if (!notificationsAsNotice) {
+				return;
+			}
+
 			var messageUrl = message.getInstruction('inviteUrl') || message.getInstruction('url');
 			var noticeOptions = notificationsAsNotice[messageType];
 			var pluginName = messageType.split('/')[0];
@@ -4621,14 +4761,12 @@ Q.onInit.add(function _Streams_onInit() {
 				return;
 			}
 
-			// skip myself messages
-			if (message.byUserId === userId) {
-				return;
-			}
-
 			// skip messages older than 24 hours
+			var expired = parseInt(Q.getObject(
+				'Q.plugins.Streams.notifications.notices.expired'
+			), 10) || 86400;
 			var timeDiff = Math.abs(new Date(message.sentTime).getTime() - new Date().getTime())/1000;
-			if (timeDiff >= parseInt(Q.Streams.notifications.notices.expired)) {
+			if (timeDiff >= expired) {
 				return;
 			}
 
@@ -4645,49 +4783,6 @@ Q.onInit.add(function _Streams_onInit() {
 					evenIfNotSubscribed: noticeOptions.evenIfNotSubscribed,
 					callback: function () {
 						var stream = this;
-
-						if (stream.fields.name === 'Streams/invited') {
-							stream.fields.title = message.getInstruction('title');
-						}
-
-						// special behavior for Streams/invite
-						if (messageType === "Streams/invited") {
-							var label = message.getInstruction('label');
-							var inviteUrl = message.getInstruction('inviteUrl');
-							var template = Q.Template.compile(text, 'handlebars');
-							var html = template({
-								app: Q.info.app,
-								info: Q.info,
-								stream: stream,
-								message: message
-							});
-
-							if (label) {
-								if (typeof label === "string") {
-									label = [label];
-								}
-								// convert labels to readable
-								Q.each(Users.labels, function (labelKey) {
-									var index = label.indexOf(labelKey);
-									if (index < 0 || !this.title) {
-										return;
-									}
-									label[index] = this.title;
-								});
-								html += " as " + label.join(', ');
-							}
-
-							html += "<br>" + content.labels.JoinItNow;
-							Q.confirm(html, function (res) {
-								if (res) {
-									Q.handle(inviteUrl, null, null, {loadUsingAjax:false});
-								}
-							}, {
-								ok: content.labels.Yes,
-								cancel: content.labels.No
-							});
-							return;
-						}
 
 						Streams.Avatar.get(message.byUserId, function (err, avatar) {
 							var source = (noticeOptions.showSubject !== false ? text : '');
@@ -4742,103 +4837,129 @@ Q.onInit.add(function _Streams_onInit() {
 		_connectSockets(true);
 	}, 'Streams');
 
-	function _Streams_onInvited() {
-		var params = Q.getObject("Q.plugins.Streams.invited.dialog");
-		if (!params || _Streams_onInvited.showed) {
-			return;
+	/**
+	 * Fill in everything the invited templates need, and render the
+	 * explanation into params.explanation. Both entry points (page load, and
+	 * after login when the server hands the payload back) need this, and it's
+	 * idempotent so calling it twice on the same params object is free.
+	 * @param {Object} params Q.plugins.Streams.invited.dialog
+	 * @param {Function} [callback] Receives (params)
+	 */
+	function _prepareInvitedParams(params, callback, force) {
+		if (params._prepared && !force) {
+			return Q.handle(callback, Streams, [params]);
 		}
-		if (Q.Users.loggedInUser && Q.Users.loggedInUser.sessionCount > 1) {
-			// return; // in this case, skip the dialog for now
-		}
-		_Streams_onInvited.showed = true;
-		var delay = params.delay || 2000;
-		var mask = Q.Masks.show('Streams.onInvited', {
-			fadeIn: 0
-		});
-		var t;
-		$(mask.element).on('click', function () {
-			_showWelcomeFlow();
-			t && clearInterval(t);
-		});
-		Q.onReady.addOnce(function () {
-			// don't use "load" event because it might not fire on the page
-			// if some image is broken for example
-			t = setTimeout(_showWelcomeFlow, delay);
-		});
-		function _showWelcomeFlow() {
-			Q.Masks.hide('Streams.onInvited');
-			var explanationTemplateName = params.explanationTemplateName || 'Streams/templates/invited/explanation';
-			Stream.construct(params.stream, function () {
-				Q.extend(params, {
-					stream: this,
-					communityId: params.communityId || Q.Users.communityId,
-					communityName: params.communityName || Q.Users.communityName,
-					button: Q.getObject('Q.text.Streams.invite.complete.accept')
-						 || Q.getObject('Q.text.Users.login.registerButton'),
-					prompt: (params.prompt !== undefined)
-						? params.prompt
-						: Q.getObject('Q.text.Streams.invite.complete.prompt')
-				});
-				let url = params.stream.fields.icon;
-				if (/\.\w{3,4}$/.test(url)) {
-					params.stream.fields.icon = url.substring(0, url.lastIndexOf('/'));
-				}
-				Q.Template.render(explanationTemplateName, params, function (err, html) {
-					params.explanation = html;
-					if (Q.Users.loggedInUserId()) {
-						_showDialog();
-					} else {
-						params.loggedInFirst = true;
-						Q.Users.login({
-							onSuccess: {'Users': _inviteComplete},
-							noClose: true,
-							explanation: html,
-							wasInvited: true
-						});
-					}
-				});
-			}, true);
-		}
-		function _inviteComplete() {
-			var params = {
-				evenIfNotRetained: true,
-				unlessSocket: true
-			};
-			var p = new Q.Pipe(['first', 'last'], function (params) {
-				Q.handle(Streams.onInviteComplete, Streams, [params.first[0], params.last[0]]);
+		var explanationTemplateName = params.explanationTemplateName
+			|| 'Streams/templates/invited/explanation';
+		Stream.construct(params.stream, function () {
+			var accept = params.acceptButton || params.button
+				|| Q.getObject('Q.text.Streams.invite.complete.accept')
+				|| Q.getObject('Q.text.Users.login.registerButton');
+			Q.extend(params, {
+				stream: this,
+				communityId: params.communityId || Q.Users.communityId,
+				communityName: params.communityName || Q.Users.communityName,
+				acceptButton: accept,
+				button: accept, // for any app template still using {{button}}
+				declineButton: params.declineButton
+					|| Q.getObject('Q.text.Streams.invite.complete.decline'),
+				prompt: (params.prompt !== undefined)
+					? params.prompt
+					: Q.getObject('Q.text.Streams.invite.complete.prompt')
 			});
-			Stream.refresh(Users.loggedInUser.id,
-				'Streams/user/firstName', p.fill('first'), params
-			);
-			Stream.refresh(Users.loggedInUser.id,
-				'Streams/user/lastName', p.fill('last'), params
-			);
-		}
-		function _showDialog() {
-			var templateName = params.templateName || 'Streams/templates/invited/complete';
-			Q.Template.render(templateName, params, function(err, html) {
-				var dialog = $(html);
-				var interval;
-				Q.Dialogs.push({
-					dialog: dialog,
-					className: 'Streams_completeInvited_dialog',
-					mask: true,
-					noClose: true,
-					closeOnEsc: false,
-					beforeClose: function () {
-						if (interval) {
-							clearInterval(interval);
-						}
-					},
-					onActivate: {'Streams.completeInvited': function _Streams_completeInvited() {
-						Streams.onInvitedDialog.handle.call(Streams, [dialog]);
+			// Don't mutate the Stream: it's the cached, retained instance and
+			// icon sizes get appended per-use elsewhere on the page.
+			var url = this.fields.icon;
+			params.streamIcon = /\.\w{3,4}$/.test(url)
+				? url.substring(0, url.lastIndexOf('/'))
+				: url;
+			Q.Template.render(explanationTemplateName, params, function (err, html) {
+				params.explanation = html;
+				params._prepared = true;
+				Q.handle(callback, Streams, [params]);
+			});
+		}, true);
+	}
+
+	/**
+	 * Show the "you were invited" dialog. Submitting the form accepts the
+	 * invite, via the Q.Streams.acceptInvite hidden field the template carries.
+	 *
+	 * Someone with no name yet is brand new and is forced through — registering
+	 * is the consent. Someone who already has a name has an account, so they can
+	 * close it instead, which leaves the invite pending exactly as declining
+	 * would (nothing persists a decline).
+	 *
+	 * @param {Object} params Prepared by _prepareInvitedParams
+	 * @param {Function} [callback] Receives (err, accepted). Fires once, from
+	 *   either the accept path or onClose, so callers can resume a login flow.
+	 */
+	function _showInvitedDialog(params, callback) {
+		var templateName = params.templateName || 'Streams/templates/invited/complete';
+		Q.Template.render(templateName, params, function (err, html) {
+			if (err) {
+				return Q.handle(callback, Streams, [err, null]);
+			}
+			var dialog = $(html);
+			var interval;
+			var accepted = false;
+			Q.Dialogs.push({
+				title: params.title || Q.text.Streams.invite.dialog.YouWereInvited,
+				dialog: dialog,
+				className: 'Streams_completeInvited_dialog',
+				mask: true,
+				noClose: !!params.nameIsMissing,
+				closeOnEsc: !params.nameIsMissing,
+				beforeClose: function () {
+					if (interval) {
+						clearInterval(interval);
+					}
+				},
+				onClose: function () {
+					if (!accepted) {
+						// left pending — same outcome as declining
+						Q.handle(callback, Streams, [null, false]);
+					}
+				},
+				onActivate: {'Streams.completeInvited': function _Streams_completeInvited() {
+					Streams.onInvitedDialog.handle.call(Streams, [dialog]);
+
+					// closing is how you decline; a template may offer a button
+					// for it, which must be type="button" so it doesn't submit
+					dialog.find('.Streams_invited_decline')
+						.on(Q.Pointer.fastclick, function () {
+							// declining is durable, not just a dialog close:
+							// Streams_before_Q_objects_handle_inviteResponse
+							// sees the special field at Q/objects time
+							Q.req('Streams/basic', ['data'], function () {
+								accepted = false;
+								dialog.data('Q/dialog').close();
+							}, {
+								method: 'post',
+								quietly: true,
+								fields: {
+									// send the token like the accept form does:
+									// the session copy isn't readable yet on the
+									// request that carries the click
+									token: params.token,
+									// and the one-time consent value, without
+									// which the server ignores this
+									'Q.Streams.inviteConsent': params.consent,
+									'Q.Streams.declineInvite': 1,
+									'Q.method': 'get'
+								}
+							});
+							return false;
+						});
+
+					if (params.nameIsMissing) {
 						var l = Q.text.Users.login;
 						dialog.find('#Streams_login_fullname')
 							.attr('maxlength', l.maxlengths.fullName)
 							.attr('placeholder', l.placeholders.fullName)
 							.plugin('Q/placeholders');
 						if (!Q.info.isTouchscreen) {
-							var $input = $('input', dialog).eq(0);
+							var $input = dialog.find('#Streams_login_fullname');
 							$input.plugin('Q/clickfocus');
 							interval = setInterval(function () {
 								if ($input.val() || $input[0] === document.activeElement) {
@@ -4847,46 +4968,134 @@ Q.onInit.add(function _Streams_onInit() {
 								$input.plugin('Q/clickfocus');
 							}, 100);
 						}
-						var $complete_form = dialog.find('form')
-							.plugin('Q/validator')
-							.submit(function(e) {
-								e.preventDefault();
-								var baseUrl = Q.baseUrl({
-									publisherId: Q.plugins.Users.loggedInUser.id,
-									streamName: "Streams/user/firstName"
-								});
-								var url = 'Streams/basic?' + $(this).serialize();
-								Q.req(url, ['data'], function _Streams_basic(err, data) {
-									var msg = Q.firstErrorMessage(err, data);
-									if (data && data.errors) {
-										$complete_form.plugin('validator', 'invalidate',
-											Q.ajaxErrors(data.errors, ['fullName'])
-										);
-										$('input', $complete_form).eq(0)
-											.plugin('Q/clickfocus');
-										return;
-									} else if (msg) {
-										return alert(msg);
-									}
-									$complete_form.plugin('Q/validator', 'reset');
-									dialog.data('Q/dialog').close();
-									_inviteComplete();
-								}, {method: "post", quietly: true, baseUrl: baseUrl});
-							}).on('submit keydown', Q.debounce(function (e) {
-								if (e.type === 'keydown'
-									&& (e.keyCode || e.which) !== 13) {
+					}
+
+					var $complete_form = dialog.find('form')
+						.plugin('Q/validator')
+						.submit(function (e) {
+							e.preventDefault();
+							var baseUrl = Q.baseUrl({
+								publisherId: Q.plugins.Users.loggedInUser.id,
+								streamName: "Streams/user/firstName"
+							});
+							var url = $(this).attr('action') + '?' + $(this).serialize();
+							Q.req(url, ['data'], function _Streams_basic(err, data) {
+								var msg = Q.firstErrorMessage(err, data);
+								if (data && data.errors) {
+									$complete_form.plugin('validator', 'invalidate',
+										Q.ajaxErrors(data.errors, ['fullName'])
+									);
+									dialog.find('#Streams_login_fullname')
+										.plugin('Q/clickfocus');
 									return;
+								} else if (msg) {
+									return alert(msg);
 								}
-								var val = dialog.find('#Streams_login_fullname').val();
-								Streams.onInvitedUserAction.handle.call(
-									[val, dialog]
-								);
-							}, 0));
-						$('button', $complete_form).on('touchstart', function () {
-							$(this).submit();
-						});
-					}}
-				});
+								$complete_form.plugin('Q/validator', 'reset');
+								accepted = true;
+								dialog.data('Q/dialog').close();
+								_inviteComplete();
+								// onInviteResolved is fired by whoever passed the
+								// callback -- firing it here too made it run twice
+								// on accept, so onboarding was pushed twice.
+								Q.handle(callback, Streams, [null, true]);
+							}, {method: "post", quietly: true, baseUrl: baseUrl});
+						}).on('submit keydown', Q.debounce(function (e) {
+							if (e.type === 'keydown'
+								&& (e.keyCode || e.which) !== 13) {
+								return;
+							}
+							var val = dialog.find('#Streams_login_fullname').val();
+							Streams.onInvitedUserAction.handle.call(
+								Streams, [val, dialog]
+							);
+						}, 0));
+					$('button[type=submit]', $complete_form).on('touchstart', function () {
+						$complete_form.submit();
+					});
+				}}
+			});
+		});
+	}
+
+	/**
+	 * Refresh the name streams and announce that the invite flow finished.
+	 * Guarded so onboarding isn't kicked off twice in one page lifetime; on a
+	 * fresh page load firing again is fine, since onboarding steps skip
+	 * whatever is already done.
+	 */
+	function _inviteComplete() {
+		var o = {
+			evenIfNotRetained: true,
+			unlessSocket: true
+		};
+		var p = new Q.Pipe(['first', 'last'], function (params) {
+			if (Streams.onInviteComplete.occurred) {
+				return;
+			}
+			Q.handle(Streams.onInviteComplete, Streams, [
+				params.first[0], params.last[0]
+			]);
+		});
+		Stream.refresh(Users.loggedInUser.id,
+			'Streams/user/firstName', p.fill('first'), o
+		);
+		Stream.refresh(Users.loggedInUser.id,
+			'Streams/user/lastName', p.fill('last'), o
+		);
+	}
+
+	/**
+	 * Page-load entry point. Only fires when the server put a payload in
+	 * script data, which it does for an invite followed in this session that
+	 * still needs explicit consent.
+	 */
+	function _Streams_onInvited() {
+		var params = Q.getObject("Q.plugins.Streams.invited.dialog");
+		if (!params || _Streams_onInvited.showed) {
+			return;
+		}
+		_Streams_onInvited.showed = true;
+		var delay = params.delay || 2000;
+		var mask = Q.Masks.show('Streams.onInvited', {
+			fadeIn: 0
+		});
+		var t;
+		var flowed = false;
+		$(mask.element).on('click', function () {
+			t && clearTimeout(t);
+			_showWelcomeFlow();
+		});
+		Q.onReady.addOnce(function () {
+			// don't use "load" event because it might not fire on the page
+			// if some image is broken for example
+			t = setTimeout(_showWelcomeFlow, delay);
+		});
+		function _showWelcomeFlow() {
+			if (flowed) {
+				return;
+			}
+			flowed = true;
+			Q.Masks.hide('Streams.onInvited');
+			_prepareInvitedParams(params, function () {
+				if (Q.Users.loggedInUserId()) {
+					// already logged in, so nothing will call setLoggedInUser
+					// and this is the only chance to ask
+					// commented-out for now, because invite may already have been accepted
+					_showInvitedDialog(params, function (err, accepted) {
+						Q.handle(Streams.onInviteResolved, Streams, [!!accepted, params]);
+					});
+				} else {
+					// after they log in or register, the server decides whether
+					// consent is still needed and sets the script data again.
+					// The Users.onLogin handler registered in Q.onInit picks
+					// that up -- nothing did, before.
+					Q.Users.login({
+						noClose: !!params.nameIsMissing,
+						explanation: params.explanation,
+						wasInvited: true
+					});
+				}
 			});
 		}
 	}
@@ -4955,26 +5164,25 @@ Q.onInit.add(function _Streams_onInit() {
 		if (!msg) {
 			throw new Q.Error("Q.Socket.onEvent('Streams/post') msg is empty");
 		}
-		var latest = Message.latestOrdinal(msg.publisherId, msg.streamName);
-		if (latest && parseInt(msg.ordinal) <= latest) {
+
+		var ptn = Streams.key(msg.publisherId, msg.streamName);
+		// Skip only if this ordinal was already processed through _message(),
+		// not merely because stream.messageCount was updated in cache
+		// (e.g. by Message.get before _simulatePosting replays the message).
+		if ((Message.latest[ptn] || 0) >= parseInt(msg.ordinal)) {
 			return;
 		}
-		// Wait until the previous message has been posted, then process this one.
-		// Will return immediately if previous message is already cached
-		// (e.g. from a post or retrieving a stream, or because there was no cache yet)
+		// Wait until the previous message has been processed, then process this one.
+		// Will return immediately if the previous ordinal is already in Message.latest.
 		var ret = Message.wait(msg.publisherId, msg.streamName, msg.ordinal-1, _message, {
 			checkMessageCache: true
 		});
 		if (ret == null) {
-			// There was no retained stream or message cache.
-			// Let's just call this anyway, and it will update the message cache.
-			// So next time latestOrdinal will be nonzero and we will only
-			// process messages in order of increasing ordinal.
+			// No retained stream or nothing processed yet — process directly.
 			_message();
 		}
 		function _message() {
-			var ptn = msg.publisherId+"\t"+msg.streamName;
-			if (Message.latest[ptn] >= parseInt(msg.ordinal)) {
+			if ((Message.latest[ptn] || 0) >= parseInt(msg.ordinal)) {
 				return; // it was already processed
 			}
 
@@ -4987,8 +5195,6 @@ Q.onInit.add(function _Streams_onInit() {
 			var message = (msg instanceof Message)
 				? msg
 				: Message.construct(msg, true);
-
-			Message.latest[ptn] = parseInt(msg.ordinal);
 
 			// update fields.messageCount of cached stream across caches
 			Streams.get.cache.each([msg.publisherId, msg.streamName], function (k, cached) {
@@ -5034,7 +5240,7 @@ Q.onInit.add(function _Streams_onInit() {
 					break;
 				case 'Streams/changed':
 					if (Q.isEmpty(instructions.changes)) {
-						return;
+						break;
 					}
 					var doRefresh = false;
 					for (var f in instructions.changes) {
@@ -5101,6 +5307,7 @@ Q.onInit.add(function _Streams_onInit() {
 			var streamType = Q.getObject("streamType", extras);
 			if (streamType) {
 				_handlers(streamType, msg, params);
+				_markMessageProcessed();
 			} else {
 				Q.Streams.get(msg.publisherId, msg.streamName, function (err) {
 					if (err) {
@@ -5108,7 +5315,12 @@ Q.onInit.add(function _Streams_onInit() {
 					}
 
 					_handlers(this.fields.type, msg, params);
+					_markMessageProcessed();
 				});
+			}
+
+			function _markMessageProcessed() {
+				Message.latest[ptn] = parseInt(msg.ordinal);
 			}
 
 			if (usingCached && priv._messageShouldRefreshStream[msg.type]) {
@@ -5166,35 +5378,39 @@ Q.onInit.add(function _Streams_onInit() {
 	
 	function _handlers(streamType, msg, params) {
 		var prefixes = _messageTypePrefixes(msg.type);
-		Q.handle(Q.getObject(['', ''], priv._messageHandlers), Streams, params);
-		Q.handle(Q.getObject([streamType, msg.type], priv._messageHandlers), Streams, params);
-		Q.handle(Q.getObject(['', msg.type], priv._messageHandlers), Streams, params);
-		Q.handle(Q.getObject([streamType, ''], priv._messageHandlers), Streams, params);
+		var ps = Streams.key(msg.publisherId, msg.streamName);
+		var cached = Q.Streams.get.cache.get([msg.publisherId, msg.streamName]);
+		var stream = priv._retainedStreams[ps] || (cached && cached.subject);
+		var ctx = stream || Streams;
+		Q.handle(Q.getObject(['', ''], priv._messageHandlers), ctx, params);
+		Q.handle(Q.getObject([streamType, msg.type], priv._messageHandlers), ctx, params);
+		Q.handle(Q.getObject(['', msg.type], priv._messageHandlers), ctx, params);
+		Q.handle(Q.getObject([streamType, ''], priv._messageHandlers), ctx, params);
 		Q.each(prefixes, function (i, prefix) {
-			Q.handle(Q.getObject([streamType, prefix], priv._messageHandlers), Streams, params);
-			Q.handle(Q.getObject(['', prefix], priv._messageHandlers), Streams, params);
+			Q.handle(Q.getObject([streamType, prefix], priv._messageHandlers), ctx, params);
+			Q.handle(Q.getObject(['', prefix], priv._messageHandlers), ctx, params);
 		});
 		Q.each([msg.publisherId, ''], function (i, publisherId) {
 			Q.each([msg.streamName, ''], function (ordinal, streamName) {
 				Q.handle(
 					Q.getObject([publisherId, streamName, ordinal], priv._streamMessageHandlers),
-					Streams,
+					ctx,
 					params
 				);
 				Q.handle(
 					Q.getObject([publisherId, streamName, msg.type], priv._streamMessageHandlers),
-					Streams,
+					ctx,
 					params
 				);
 				Q.handle(
 					Q.getObject([publisherId, streamName, ''], priv._streamMessageHandlers),
-					Streams,
+					ctx,
 					params
 				);
 				Q.each(prefixes, function (i, prefix) {
 					Q.handle(
 						Q.getObject([publisherId, streamName, prefix], priv._streamMessageHandlers),
-						Streams,
+						ctx,
 						params
 					);
 				});
@@ -5313,7 +5529,7 @@ Streams.Transcript = {
         let prevFinalAt = self.latestFinalAt;
         if (isFinal) self.latestFinalAt = Date.now();
         let chunkToSend = finalTranscript || interimTranscript;
-        if (chunkToSend.trim() == '') return;
+        if (!chunkToSend || chunkToSend.trim() == '') return;
         self.send({
             isFinal: isFinal,
             transcript: finalTranscript || interimTranscript,
@@ -5512,7 +5728,7 @@ function _updateRelatedCache(msg, instructions) {
 		);
 		Streams.Stream.refresh(
 			instructions.toPublisherId, instructions.toStreamName,
-			null, { messages: true, unlessSocket: true }
+			null, { messages: true, unlessSocket: true, evenIfNotRetained: true }
 		);
 	} else if (instructions.fromPublisherId) {
 		Streams.related.cache.removeEach(
@@ -5520,7 +5736,7 @@ function _updateRelatedCache(msg, instructions) {
 		);
 		Streams.Stream.refresh(
 			instructions.fromPublisherId, instructions.fromStreamName,
-			null, { messages: true, unlessSocket: true }
+			null, { messages: true, unlessSocket: true, evenIfNotRetained: true }
 		);
 	}
 }

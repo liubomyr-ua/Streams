@@ -519,8 +519,12 @@ Q.Tool.define('Streams/chat', function(options) {
 		}
 
 		var $element = $("<li class='Streams_chat_addon'></li>");
-
-		$("<div class='Streams_chat_addon_icon'><img src='" + Q.url(params.icon) + "' /></div>").appendTo($element);
+		var $div = $("<div class='Streams_chat_addon_icon'>").appendTo($element);
+		if (params.icon) {
+			$div.append($('<img />').attr('src', Q.url(params.icon)));
+		} else if (params.emoji) {
+			$div.append($('<span class="Streams_chat_addon_emoji">').text(params.emoji));
+		}
 
 		$("<span class='Streams_chat_addon_title'>" + params.title + "</span>").appendTo($element);
 
@@ -718,8 +722,11 @@ Q.Tool.define('Streams/chat', function(options) {
 							});
 
 							element = Q.Tool.setUpElement(element, toolName, fields);
+							var defaultTitle = Q.info.isTouchscreen
+								? Q.text.Q.imagepicker.cropping.touchscreen
+								: Q.text.Q.imagepicker.cropping.notTouchscreen;
 							Q.invoke(Q.extend({
-								title: stream.fields.title,
+								title: stream.fields.title || defaultTitle,
 								className: "Streams_chat_" + Q.normalize(stream.fields.type),
 								content: element,
 								trigger: $toolElement[0],

@@ -41,7 +41,6 @@ Streams_Message.handlers = {};
 
 Streams_Message.construct = function Streams_Message_construct(fields, retrieved) {
 	if (Q.isEmpty(fields)) {
-		Q.handle(callback, this, ["Streams.Message constructor: fields are missing"]);
 		return false;
 	}
 	if (fields.fields) {
@@ -113,14 +112,15 @@ var Mp = Streams_Message.prototype;
 
 /**
  * Get all the instructions from a message.
- * 
- * @method getAll
+ * If there is an error, still returns an object, but it's empty.
+ * @method getAllInstructions
+ * @return {Object}
  */
 Mp.getAllInstructions = function _Message_prototype_getAllInstructions () {
 	try {
 		return JSON.parse(this.fields.instructions);
 	} catch (e) {
-		return undefined;
+		return {};
 	}
 };
 
@@ -129,8 +129,9 @@ Mp.getAllInstructions = function _Message_prototype_getAllInstructions () {
  * 
  * @method getInstruction
  * @param {String} instructionName
+ * @return {any}
  */
-Mp.getInstruction = function _Message_prototype_get (instructionName) {
+Mp.getInstruction = function _Message_prototype_getInstruction (instructionName) {
 	var instr = this.getAllInstructions();
 	return Q.getObject([instructionName], instr);
 };

@@ -350,7 +350,7 @@ class Streams_Stream extends Base_Streams_Stream
 	 *	@param {array} [$options.html] an array of ($template, $batchName) such as ("MyApp/foo.handlebars", "foo") for generating html snippets which can then be viewed from and printed via the action Streams/invitations?batchName=$batchName&invitingUserId=$asUserId&limit=$limit&offset=$offset
 	 * @param {string} [$options.asUserId=Users::loggedInUser(true)->id] Invite as this user id, defaults to logged-in user
 	 * @param {boolean} [$options.skipAccess] whether to skip access checks when adding labels and contacts
-	 * @param {boolean} [$options.skipLogin=false] if true, skip the login dialog when someone follows the invite link. Stored in the invite's extra field.
+	 * @param {boolean} [$options.dontAutoLogin=false] if true, skip the login dialog when someone follows the invite link. Stored in the invite's extra field.
 	 * @see Users::addLink()
 	 * @return {array} Returns array with keys 
 	 *  "success", "userIds", "statuses", "identifierTypes", "alreadyParticipating".
@@ -891,14 +891,7 @@ class Streams_Stream extends Base_Streams_Stream
 				// unless we're already handling saving a user
 				$user = Users_User::fetch($this->publisherId, true);
 				$user->$publicField = $modifiedFields[$field];
-				try {
-					// attempt to save user with the username
-					$user->save(false, false, true);
-				} catch (Users_Exception_UsernameExists $e) {
-					// fallback to a null username, but still save the user')
-					$user->username = null;
-					$user->save(false, false, true);
-				}
+				$user->save(false, false, true);
 			} catch (Exception $e) {
 				Streams::$beingSaved[$publicField] = array();
 				throw $e;
@@ -967,6 +960,9 @@ class Streams_Stream extends Base_Streams_Stream
 		 */
 		$params = array('stream' => $this);
 		Q::event("Streams/Stream/save/{$this->type}", $params, 'after');
+
+		// Invalidate server-side component cache for pages depending on this stream
+		Q_Response::invalidateCacheDeps($this->publisherId . '/' . $this->name);
 		
 		if ($wasInserted !== 'insertManyAndExecute'
 		or $asUserId === $this->publisherId) {
@@ -1615,6 +1611,7 @@ class Streams_Stream extends Base_Streams_Stream
 	function getReadLevel($options = array())
 	{
 		$readLevel = $this->get('readLevel', $this->readLevel);
+		$invite = null;
 		if ($fields = Q::ifset($_SESSION, 'Streams', 'invite', array())) {
 			$invite = new Streams_Invite($fields);
 		} else if (Streams_Invite::$followed) {
@@ -1627,7 +1624,6 @@ class Streams_Stream extends Base_Streams_Stream
 		and $invite->publisherId == $this->publisherId
 		and $invite->streamName == $this->name
 		and $invite->readLevel >= 0) {
-			// set the readLevel, but not writeLevel or adminLevel
 			$readLevel = max($readLevel, $invite->readLevel);
 		}
 		$fp = self::getConfigField($this->type, 'fromPermissions', array());
@@ -1641,14 +1637,31 @@ class Streams_Stream extends Base_Streams_Stream
 	}
 
 	/**
-	 * Gets the write level on the stream, taking into account fromPermissions config
+	 * Gets the write level on the stream, taking into account any invite
+	 * that may have been followed, and fromPermissions config
 	 * @method getWriteLevel
 	 * @param {array} [$options]
+	 * @param {array} [$options.ignoreInvite] Do not check Streams_Invite::$followed or $_SESSION['Streams']['invite']
 	 * @return {integer}
 	 */
 	function getWriteLevel($options = array())
 	{
 		$writeLevel = $this->get('writeLevel', $this->writeLevel);
+		$invite = null;
+		if ($fields = Q::ifset($_SESSION, 'Streams', 'invite', array())) {
+			$invite = new Streams_Invite($fields);
+		} else if (Streams_Invite::$followed) {
+			$invite = Streams_Invite::$followed;
+		} else if ($token = Q::ifset($_SESSION, 'Streams', 'inviteFollowedToken', null)) {
+			$invite = Streams_Invite::fromToken($token);
+		}
+		if (empty($options['ignoreInvite'])
+		and $invite
+		and $invite->publisherId == $this->publisherId
+		and $invite->streamName == $this->name
+		and $invite->writeLevel >= 0) {
+			$writeLevel = max($writeLevel, $invite->writeLevel);
+		}
 		$fp = self::getConfigField($this->type, 'fromPermissions', array());
 		foreach ($this->getAllPermissions() as $p) {
 			if (isset($fp[$p]['writeLevel'])) {
@@ -1660,14 +1673,31 @@ class Streams_Stream extends Base_Streams_Stream
 	}
 
 	/**
-	 * Gets the admin level on the stream, taking into account fromPermissions config
+	 * Gets the admin level on the stream, taking into account any invite
+	 * that may have been followed, and fromPermissions config
 	 * @method getAdminLevel
 	 * @param {array} [$options]
+	 * @param {array} [$options.ignoreInvite] Do not check Streams_Invite::$followed or $_SESSION['Streams']['invite']
 	 * @return {integer}
 	 */
 	function getAdminLevel($options = array())
 	{
 		$adminLevel = $this->get('adminLevel', $this->adminLevel);
+		$invite = null;
+		if ($fields = Q::ifset($_SESSION, 'Streams', 'invite', array())) {
+			$invite = new Streams_Invite($fields);
+		} else if (Streams_Invite::$followed) {
+			$invite = Streams_Invite::$followed;
+		} else if ($token = Q::ifset($_SESSION, 'Streams', 'inviteFollowedToken', null)) {
+			$invite = Streams_Invite::fromToken($token);
+		}
+		if (empty($options['ignoreInvite'])
+		and $invite
+		and $invite->publisherId == $this->publisherId
+		and $invite->streamName == $this->name
+		and $invite->adminLevel >= 0) {
+			$adminLevel = max($adminLevel, $invite->adminLevel);
+		}
 		$fp = self::getConfigField($this->type, 'fromPermissions', array());
 		foreach ($this->getAllPermissions() as $p) {
 			if (isset($fp[$p]['adminLevel'])) {
@@ -2019,7 +2049,9 @@ class Streams_Stream extends Base_Streams_Stream
 			}
 			$item[] = $permissions;
 		}
-		$inheritAccess = json_decode($this->inheritAccess, true);
+		$inheritAccess = isset($this->inheritAccess)
+			? json_decode($this->inheritAccess, true)
+			: null;
 		if (!$inheritAccess or !is_array($inheritAccess)) {
 			$inheritAccess = array($item);
 		} else {
@@ -2222,7 +2254,7 @@ class Streams_Stream extends Base_Streams_Stream
 	 * @param {array} [$options=array()] Can include "skipAccess"
 	 * @static
 	 */
-	function close($asUserId, $options = array())
+	function close($asUserId = null, $options = array())
 	{
 		return Streams::close($asUserId, $this->publisherId, $this->name, $options);
 	}
@@ -2342,8 +2374,8 @@ class Streams_Stream extends Base_Streams_Stream
 		}
 		$result['access'] = array(
 			'readLevel' => $this->getReadLevel($options),
-			'writeLevel' => $this->get('writeLevel', $this->writeLevel),
-			'adminLevel' => $this->get('adminLevel', $this->adminLevel),
+			'writeLevel' => $this->getWriteLevel($options),
+			'adminLevel' => $this->getAdminLevel($options),
 			'permissions' => $this->get('permissions', $this->getAllPermissions())
 		);
 		$result['isRequired'] = $this->isRequired();

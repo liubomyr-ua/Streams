@@ -491,6 +491,10 @@ Streams.listen = function (options, servers) {
 			return console.error("Streams.Stream.on POST: invalid stream!!!");
 		}
 
+		Q.Response.invalidateCacheDeps(
+			stream.fields.publisherId + '/' + stream.fields.name
+		);
+
 		if (_messageHandlers[msg.fields.type]) {
 			_messageHandlers[msg.fields.type].call(this, msg);
 		}
@@ -516,167 +520,15 @@ Streams.listen = function (options, servers) {
 		}
 		client.alreadyListeningStreams = true;
 
-		client.on('Streams/observe',
-		function (publisherId, streamName, messageCount, fn) {
-			if (typeof messageCount === 'number') {
-				Streams.Message.SELECT().where({
-					publisherId: publisherId,
-					streamName: streamName,
-					ordinal: new Db.Range(messageCount, false)
-				}).execute(function (err, rows) {
-					_continue(err ? [] : rows.map(row => row.fields));
-				});
-			}
-			function _continue(messages) {
-				var NotAuthorizedException = {
-					type: 'Users.Exception.NotAuthorized',
-					message: 'Not Authorized'
-				};
-				var now = Date.now() / 1000;
-				if (!Q.Utils.validateCapability(client.capability, 'Streams/observe')) {
-					return (typeof fn == 'function') && fn(NotAuthorizedException);
-				}
-				if (typeof publisherId !== 'string'
-				|| typeof streamName !== 'string') {
-					return (typeof fn == 'function') && fn({
-						type: 'Streams.Exception.BadArguments',
-						message: 'Bad arguments'
-					});
-				}
-				var observer = Q.getObject(
-					[publisherId, streamName, client.id], Streams.observers
-				);
-				if (observer) {
-					return (typeof fn == 'function') && fn(null, []);
-				}
-				var byUserId = client.capability.userId;
-				Streams.fetchOne(byUserId || '', publisherId, streamName, function (err, stream) {
-					if (err || !stream) {
-						return (typeof fn == 'function') && fn(NotAuthorizedException);
-					}
-					stream.testReadLevel('messages', function (err, allowed) {
-						if (err || !allowed) {
-							return (typeof fn == 'function') && fn(NotAuthorizedException);
-						}
-						var clients = Q.getObject([publisherId, streamName], Streams.observers) || {};
-						var max = Streams.Stream.getConfigField(
-							stream.fields.type,
-							'observersMax'
-						);
-						if (max && Object.keys(clients).length >= max - 1) {
-							return (typeof fn == 'function') && fn({
-								type: 'Streams.Exception.TooManyObservers',
-								message: 'too many observers already'
-							});
-						}
-						Q.setObject(
-							[publisherId, streamName, client.id], client, Streams.observers
-						);
-						Q.setObject(
-							[client.id, publisherId, streamName], true, Streams.observing
-						);
-						return (typeof fn == 'function') && fn(null, messages);
-					});
-				});
-			}
-		});
-		client.on('Streams/neglect',
-		function (publisherId, streamName, fn) {
-			var o = Streams.observers;
-			if (!Q.getObject([publisherId, streamName, client.id], o)) {
-				return (typeof fn == 'function') && fn(null, false);
-			}
-			delete o[publisherId][streamName][client.id];
-			delete Streams.observing[client.id][publisherId][streamName];
-			return (typeof fn == 'function') && fn(null, true);
-		});
-		client.on('Streams/ephemeral',
-		function (publisherId, streamName, payload, dontNotifyObservers, fn) {
-			if (!payload.type) {
-				return (typeof fn == 'function') && fn("Payload must have type set");
-			}
-			if (!Q.Utils.validateCapability(client.capability, 'Users/socket')) {
-				return (typeof fn == 'function') && fn("Capability not valid", null);
-			}
-			var byUserId = client.capability.userId;
-			Streams.fetchOne(byUserId, publisherId, streamName, function (err, stream) {
-				if (err) {
-					return (typeof fn == 'function') && fn(err, false);
-				}
-				var ephemeralTypes  = Streams.Stream.getConfigField(
-					stream.fields.type,
-					'ephemerals'
-				);
-				if (!ephemeralTypes[payload.type]) {
-					var err2 = 'Ephemeral of type "' + payload.type
-						+ '" is not supported by stream of type "' + stream.fields.type + '"';
-					return (typeof fn == 'function') && fn(err2, false);
-				}
-				var ephemeral = new Streams.Ephemeral(payload, Date.now() / 1000);
-				stream.notifyParticipants(  // was: this.notifyParticipants
-					'Streams/ephemeral', ephemeral, dontNotifyObservers, fn
-				);
-			});
-		});
-
-		// A transcript session begins. Creates the session bag and fires 'sessionStart',
-		// which AI (pipeline) and Media (presentation start record) react to.
-		client.on('Streams/transcript/session/start', function (data) {
-			var userId = client.capability && client.capability.userId;
-			if (!userId) return;
-			var session = TranscriptSession.create(client, userId, data, Q);
-			transcriptEmitter.emitSessionStart(session, Q);
-		});
-		
-		// Runtime mode toggle (composition / navigation / transcription).
-		client.on('Streams/transcript/session/modes', function (data) {
-			var session = TranscriptSession.get(client.id);
-			if (!session || !data) return;
-			['composition', 'navigation', 'transcription'].forEach(function (m) {
-				if (data[m] !== undefined) session.modes[m] = !!data[m];
-			});
-		});
-		
-		client.on('Streams/transcript/session/stop', function () {
-			var session = TranscriptSession.get(client.id);
-			if (session) TranscriptSession.close(session);
-		});
-		
-		// Single handler for every utterance source — native SpeechRecognition, an AI
-		// adapter's results, typed text. Shape: { transcript, isFinal, confidence,
-		// speaker, slideIndex?, pdf? }. Interim chunks are dropped inside process();
-		// each final fires Streams.Transcript's 'processed' event, which is how the AI
-		// pipeline runs.
-		client.on('Streams/utterance', function (data) {
-			var session = TranscriptSession.get(client.id);
-			if (!session) return;
-			Transcript.process(session, data, Q, Users);
-		});
-		
-		// Session teardown. emitSessionEnd fires before removal, so AI/Media handlers
-		// still see the live session (AI re-broadcasts; Media posts the end record).
-		// If Streams.js already has a disconnect handler in this block, add these three
-		// lines to it rather than registering a second one.
-		client.on('disconnect', function () {
-			var session = TranscriptSession.get(client.id);
-			if (session) {
-				TranscriptSession.close(session);
-				transcriptEmitter.emitSessionEnd(session);
-				TranscriptSession.remove(client.id);
-			}
-
-			var observing = Streams.observing[client.id];
-			if (!observing) {
-				return;
-			}
-			for (var publisherId in observing) {
-				var p = observing[publisherId];
-				for (var streamName in p) {
-					delete Streams.observers[publisherId][streamName][client.id];
-				}
-			}
-			delete Streams.observing[client.id];
-		});
+		client.on('Streams/observe', _clientHandlers.observe);
+		client.on('Streams/neglect', _clientHandlers.neglect);
+		client.on('Streams/ephemeral', _clientHandlers.ephemeral);
+		client.on('Streams/check', _clientHandlers.check);
+		client.on('Streams/transcript/session/start', _clientHandlers.transcriptStart);
+		client.on('Streams/transcript/session/modes', _clientHandlers.transcriptModes);
+		client.on('Streams/transcript/session/stop', _clientHandlers.transcriptStop);
+		client.on('Streams/utterance', _clientHandlers.utterance);
+		client.on('disconnect', _clientHandlers.disconnect);
 	});
 	return Streams.listen.result = {
 		internal: server,
@@ -773,6 +625,10 @@ function _registerStreamsMethods(server) {
 			name: stream.fields.name
 		});
 		Streams.Stream.emit('remove', stream, clientId);
+
+		Q.Response.invalidateCacheDeps(
+			stream.fields.publisherId + '/' + stream.fields.name
+		);
 	});
 
 	// Streams/Stream/create — a stream was created; emit local event.
@@ -788,6 +644,10 @@ function _registerStreamsMethods(server) {
 			);
 		}
 		Streams.Stream.emit('create', stream, clientId);
+
+		Q.Response.invalidateCacheDeps(
+			stream.fields.publisherId + '/' + stream.fields.name
+		);
 	});
 
 	// Streams/Message/post — a single message was posted.
@@ -1166,6 +1026,80 @@ Users.on('disconnected', function (userId) {
  *  Provide additional query options like 'limit', 'offset', 'orderBy', 'where' etc.
  *  @see Db_Query_Mysql::options().
  */
+/**
+ * Returns the names of the Db.Row classes that extend a given stream type,
+ * as configured under Streams/types/<type>/extend (merged with the '*' default).
+ * Node mirror of the PHP Streams::getExtendClasses(). Node does not join extend
+ * tables automatically the way PHP does, so callers that need extend fields pass
+ * {withExtendClasses: true} to Streams.fetch (see below).
+ * @method getExtendClasses
+ * @static
+ * @param {String} type The stream type, e.g. "Safebox/action"
+ * @return {Array} array of class names, e.g. ["Safebox_ActionExtend"]
+ */
+Streams.getExtendClasses = function (type) {
+	var result = [];
+	['*', type].forEach(function (t) {
+		var e = Q.Config.get(['Streams', 'types', t, 'extend'], null);
+		if (!e) {
+			return;
+		}
+		if (typeof e === 'string') {
+			result.push(e);
+		} else if (Array.isArray(e)) {
+			e.forEach(function (k) { if (typeof k === 'string') { result.push(k); } });
+		} else if (Q.isPlainObject(e)) {
+			for (var k in e) { result.push(k); }
+		}
+	});
+	return result.filter(function (v, i) { return result.indexOf(v) === i; });
+};
+
+/**
+ * For each stream, loads any configured extend-table rows (keyed by
+ * publisherId + streamName) and merges their columns into stream.fields,
+ * so extend fields become first-class on the fetched stream. Missing extend
+ * rows and missing Node classes are skipped silently. Used by Streams.fetch
+ * when options.withExtendClasses is true.
+ * @method fetchExtendClasses
+ * @static
+ * @param {Array} streams array of Streams.Stream objects (with .fields)
+ * @param {Function} callback receives (err)
+ */
+Streams.fetchExtendClasses = function (streams, callback) {
+	var pending = 1, firstErr = null;
+	function done() { if (--pending === 0) { callback(firstErr); } }
+	(streams || []).forEach(function (stream) {
+		if (!stream || !stream.fields || !stream.fields.type) {
+			return;
+		}
+		Streams.getExtendClasses(stream.fields.type).forEach(function (className) {
+			var Cls;
+			try { Cls = Q.require(className.replace(/_/g, '/')); }
+			catch (e) { return; }
+			if (!Cls || typeof Cls.SELECT !== 'function') {
+				return;
+			}
+			++pending;
+			Cls.SELECT('*').where({
+				publisherId: stream.fields.publisherId,
+				streamName:  stream.fields.name
+			}).execute(function (err, rows) {
+				if (err) { firstErr = firstErr || err; return done(); }
+				if (rows && rows.length && rows[0] && rows[0].fields) {
+					var rf = rows[0].fields;
+					for (var f in rf) {
+						if (f === 'publisherId' || f === 'streamName') { continue; }
+						stream.fields[f] = rf[f];
+					}
+				}
+				done();
+			});
+		});
+	});
+	done();
+};
+
 Streams.fetch = function (asUserId, publisherId, streamName, callback, fields, options) {
 	if (!callback) return;
 	if (!publisherId || !streamName) {
@@ -1239,7 +1173,16 @@ Streams.fetch = function (asUserId, publisherId, streamName, callback, fields, o
 					return;
 				}
 			}
-			callback(null, subjects);
+			if (!options.withExtendClasses) {
+				return callback(null, subjects);
+			}
+			// opt-in: merge configured extend-table fields into the fetched streams
+			Streams.fetchExtendClasses(res, function (extendErr) {
+				if (extendErr) {
+					return callback(extendErr);
+				}
+				callback(null, subjects);
+			});
 		});
 		for (var i=0; i<res.length; i++) {
 			res[i].calculateAccess(asUserId, p.fill(res[i].fields.name));
@@ -1290,7 +1233,16 @@ Streams.fetchOne = function (asUserId, publisherId, streamName, callback, fields
 		    return callback(null, null);
 		}
 		res[0].calculateAccess(asUserId, function () {
-		    callback.call(res[0], null, res[0]);
+			if (!options || !options.withExtendClasses) {
+			    return callback.call(res[0], null, res[0]);
+			}
+			// opt-in: merge configured extend-table fields into the fetched stream
+			Streams.fetchExtendClasses([res[0]], function (extendErr) {
+				if (extendErr) {
+					return callback.call(res[0], extendErr);
+				}
+				callback.call(res[0], null, res[0]);
+			});
 		});
 	});
 };
@@ -2022,6 +1974,335 @@ Streams.Mentions = require('Streams/Mentions');
 Streams.Ephemeral = require('Streams/Ephemeral');
 Streams.Actions = require('Streams/Actions');
 Streams.Commands =  Q.require('Streams/Commands');
+
+/**
+ * Socket.io client event handlers for the Streams plugin.
+ * Each method is registered via client.on() in the /Q namespace
+ * connection handler. Socket.io binds `this` to the client.
+ * @property _clientHandlers
+ * @type Object
+ * @private
+ */
+var _clientHandlers = {
+
+	/**
+	 * Client wants to observe a stream (receive real-time updates).
+	 * Validates capability, checks access level, enforces observer cap,
+	 * and catches up any messages missed since the client's messageCount.
+	 * @method observe
+	 * @param {String} publisherId
+	 * @param {String} streamName
+	 * @param {Number} messageCount Client's last known messageCount
+	 * @param {Function} fn Acknowledgment callback
+	 */
+	observe: function (publisherId, streamName, messageCount, fn) {
+		var client = this;
+		if (typeof messageCount === 'number') {
+			Streams.Message.SELECT().where({
+				publisherId: publisherId,
+				streamName: streamName,
+				ordinal: new Db.Range(messageCount, false)
+			}).execute(function (err, rows) {
+				_continueObserve(client, publisherId, streamName,
+					err ? [] : rows.map(function (row) { return row.fields; }), fn);
+			});
+		} else {
+			_continueObserve(client, publisherId, streamName, [], fn);
+		}
+	},
+
+	/**
+	 * Client wants to stop observing a stream.
+	 * @method neglect
+	 * @param {String} publisherId
+	 * @param {String} streamName
+	 * @param {Function} fn Acknowledgment callback
+	 */
+	neglect: function (publisherId, streamName, fn) {
+		var client = this;
+		var o = Streams.observers;
+		if (!Q.getObject([publisherId, streamName, client.id], o)) {
+			return (typeof fn == 'function') && fn(null, false);
+		}
+		delete o[publisherId][streamName][client.id];
+		delete Streams.observing[client.id][publisherId][streamName];
+		return (typeof fn == 'function') && fn(null, true);
+	},
+
+	/**
+	 * Client sends an ephemeral (non-persisted broadcast).
+	 * Validates capability and checks that the ephemeral type
+	 * is allowed for this stream type.
+	 * @method ephemeral
+	 * @param {String} publisherId
+	 * @param {String} streamName
+	 * @param {Object} payload Ephemeral payload with type property
+	 * @param {Boolean} dontNotifyObservers
+	 * @param {Function} fn Callback
+	 */
+	ephemeral: function (publisherId, streamName, payload, dontNotifyObservers, fn) {
+		var client = this;
+		if (!payload.type) {
+			return (typeof fn == 'function') && fn("Payload must have type set");
+		}
+		if (!Q.Utils.validateCapability(client.capability, 'Users/socket')) {
+			return (typeof fn == 'function') && fn("Capability not valid", null);
+		}
+		var byUserId = client.capability.userId;
+		Streams.fetchOne(byUserId, publisherId, streamName, function (err, stream) {
+			if (err) {
+				return (typeof fn == 'function') && fn(err, false);
+			}
+			var ephemeralTypes = Streams.Stream.getConfigField(
+				stream.fields.type, 'ephemerals'
+			);
+			if (!ephemeralTypes[payload.type]) {
+				var err2 = 'Ephemeral of type "' + payload.type
+					+ '" is not supported by stream of type "'
+					+ stream.fields.type + '"';
+				return (typeof fn == 'function') && fn(err2, false);
+			}
+			var ephemeral = new Streams.Ephemeral(payload, Date.now() / 1000);
+			stream.notifyParticipants(
+				'Streams/ephemeral', ephemeral, dontNotifyObservers, fn
+			);
+		});
+	},
+
+	/**
+	 * Client asks which of its retained streams have new messages
+	 * since its last known messageCount. Uses Streams.fetchOne()
+	 * for access control. Rate-limited via Users.Quota.
+	 * @method check
+	 * @param {Object} data { publisherId: { streamName: messageCount, ... }, ... }
+	 * @param {Function} callback Receives changed streams or { error: msg }
+	 */
+	check: function (data, callback) {
+		if (typeof callback !== 'function') return;
+		if (!data || typeof data !== 'object') {
+			return callback({ error: 'Invalid data' });
+		}
+		var client = this;
+		var userId = client.userId || '';
+		Users.Quota.check(
+			userId || 'anonymous', 'Streams/check', false,
+			function (err, quota) {
+				if (err || quota === false) {
+					return callback({ error: 'Quota exceeded' });
+				}
+				_doStreamsCheck(client, userId, data, callback);
+			}
+		);
+	},
+
+	/**
+	 * A transcript session begins. Creates the session bag and
+	 * fires 'sessionStart', which AI (pipeline) and Media
+	 * (presentation start record) react to.
+	 * @method transcriptStart
+	 * @param {Object} data Session configuration
+	 */
+	transcriptStart: function (data) {
+		var client = this;
+		var userId = client.capability && client.capability.userId;
+		if (!userId) return;
+		var Transcript = Q.require('Streams/Transcript');
+		var TranscriptSession = Q.require('Streams/Transcript/Session');
+		var transcriptEmitter = Q.require('Streams/TranscriptEmitter').transcriptEmitter;
+		var session = TranscriptSession.create(client, userId, data, Q);
+		transcriptEmitter.emitSessionStart(session, Q);
+	},
+
+	/**
+	 * Runtime mode toggle (composition / navigation / transcription).
+	 * @method transcriptModes
+	 * @param {Object} data Mode flags
+	 */
+	transcriptModes: function (data) {
+		var client = this;
+		var TranscriptSession = Q.require('Streams/Transcript/Session');
+		var session = TranscriptSession.get(client.id);
+		if (!session || !data) return;
+		['composition', 'navigation', 'transcription'].forEach(function (m) {
+			if (data[m] !== undefined) session.modes[m] = !!data[m];
+		});
+	},
+
+	/**
+	 * Stop a transcript session.
+	 * @method transcriptStop
+	 */
+	transcriptStop: function () {
+		var client = this;
+		var TranscriptSession = Q.require('Streams/Transcript/Session');
+		var session = TranscriptSession.get(client.id);
+		if (session) TranscriptSession.close(session);
+	},
+
+	/**
+	 * Single handler for every utterance source — native
+	 * SpeechRecognition, an AI adapter's results, typed text.
+	 * Interim chunks are dropped inside process(); each final
+	 * fires Streams.Transcript's 'processed' event.
+	 * @method utterance
+	 * @param {Object} data { transcript, isFinal, confidence, speaker, ... }
+	 */
+	utterance: function (data) {
+		var client = this;
+		var Transcript = Q.require('Streams/Transcript');
+		var TranscriptSession = Q.require('Streams/Transcript/Session');
+		var session = TranscriptSession.get(client.id);
+		if (!session) return;
+		Transcript.process(session, data, Q, Users);
+	},
+
+	/**
+	 * Client disconnected — clean up transcript sessions
+	 * and observer records.
+	 * @method disconnect
+	 */
+	disconnect: function () {
+		var client = this;
+
+		// Clean up transcript session
+		var TranscriptSession = Q.require('Streams/Transcript/Session');
+		var transcriptEmitter = Q.require('Streams/TranscriptEmitter').transcriptEmitter;
+		var session = TranscriptSession.get(client.id);
+		if (session) {
+			TranscriptSession.close(session);
+			transcriptEmitter.emitSessionEnd(session);
+			TranscriptSession.remove(client.id);
+		}
+
+		// Clean up observer records
+		var observing = Streams.observing[client.id];
+		if (!observing) return;
+		for (var publisherId in observing) {
+			var p = observing[publisherId];
+			for (var streamName in p) {
+				delete Streams.observers[publisherId][streamName][client.id];
+			}
+		}
+		delete Streams.observing[client.id];
+	}
+};
+
+/**
+ * Continue the observe flow after message catchup query.
+ * Validates capability, checks access, enforces observer cap.
+ * @method _continueObserve
+ * @private
+ * @param {Object} client Socket.io client
+ * @param {String} publisherId
+ * @param {String} streamName
+ * @param {Array} messages Missed messages to send with ack
+ * @param {Function} fn Callback
+ */
+function _continueObserve(client, publisherId, streamName, messages, fn) {
+	var NotAuthorizedException = {
+		type: 'Users.Exception.NotAuthorized',
+		message: 'Not Authorized'
+	};
+	if (!Q.Utils.validateCapability(client.capability, 'Streams/observe')) {
+		return (typeof fn == 'function') && fn(NotAuthorizedException);
+	}
+	if (typeof publisherId !== 'string'
+	|| typeof streamName !== 'string') {
+		return (typeof fn == 'function') && fn({
+			type: 'Streams.Exception.BadArguments',
+			message: 'Bad arguments'
+		});
+	}
+	var observer = Q.getObject(
+		[publisherId, streamName, client.id], Streams.observers
+	);
+	if (observer) {
+		return (typeof fn == 'function') && fn(null, []);
+	}
+	var byUserId = client.capability.userId;
+	Streams.fetchOne(byUserId || '', publisherId, streamName, function (err, stream) {
+		if (err || !stream) {
+			return (typeof fn == 'function') && fn(NotAuthorizedException);
+		}
+		stream.testReadLevel('messages', function (err, allowed) {
+			if (err || !allowed) {
+				return (typeof fn == 'function') && fn(NotAuthorizedException);
+			}
+			var clients = Q.getObject(
+				[publisherId, streamName], Streams.observers
+			) || {};
+			var max = Streams.Stream.getConfigField(
+				stream.fields.type, 'observersMax'
+			);
+			if (max && Object.keys(clients).length >= max - 1) {
+				return (typeof fn == 'function') && fn({
+					type: 'Streams.Exception.TooManyObservers',
+					message: 'too many observers already'
+				});
+			}
+			Q.setObject(
+				[publisherId, streamName, client.id], client, Streams.observers
+			);
+			Q.setObject(
+				[client.id, publisherId, streamName], true, Streams.observing
+			);
+			return (typeof fn == 'function') && fn(null, messages);
+		});
+	});
+}
+
+/**
+ * Validate, filter, and fetch streams for a Streams/check request.
+ * Only checks streams the client is currently observing.
+ * @method _doStreamsCheck
+ * @private
+ * @param {Object} client Socket.io client
+ * @param {String} userId Authenticated user or empty string
+ * @param {Object} data { publisherId: { streamName: messageCount } }
+ * @param {Function} callback Receives { publisherId: { streamName: { messageCount, updatedTime } } }
+ */
+function _doStreamsCheck(client, userId, data, callback) {
+	var max = Q.Config.get(['Streams', 'check', 'maxStreams'], 100);
+	var fetches = [];
+	var observing = Streams.observing[client.id] || {};
+	var hasObserving = !Q.isEmpty(observing);
+
+	Q.each(data, function (publisherId, streams) {
+		if (typeof publisherId !== 'string') return;
+		if (!streams || typeof streams !== 'object') return;
+		Q.each(streams, function (streamName, clientMC) {
+			if (fetches.length >= max) return;
+			if (typeof streamName !== 'string') return;
+			if (typeof clientMC !== 'number') return;
+			if (hasObserving && (!observing[publisherId]
+			|| !observing[publisherId][streamName])) return;
+			fetches.push({
+				publisherId: publisherId,
+				streamName: streamName,
+				clientMC: clientMC
+			});
+		});
+	});
+
+	if (!fetches.length) return callback({});
+
+	var changed = {};
+	var remaining = fetches.length;
+
+	Q.each(fetches, function (i, f) {
+		Streams.fetchOne(userId, f.publisherId, f.streamName, function (err, stream) {
+			if (!err && stream
+			&& parseInt(stream.fields.messageCount) > f.clientMC) {
+				if (!changed[f.publisherId]) changed[f.publisherId] = {};
+				changed[f.publisherId][f.streamName] = {
+					messageCount: parseInt(stream.fields.messageCount),
+					updatedTime: stream.fields.updatedTime
+				};
+			}
+			if (--remaining === 0) callback(changed);
+		});
+	});
+}
 
 /**
  * @property _messageHandlers
