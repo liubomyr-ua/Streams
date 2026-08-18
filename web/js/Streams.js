@@ -5292,7 +5292,7 @@ Streams.Transcript = {
 
     procesTranscript: function (event) {
         var self = this;
-        let interimTranscript = null;
+        let interimTranscript = '';
         let finalTranscript = null;
         let confidence = null;
 
